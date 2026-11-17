@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 BBIBOLL+肯特纳 双形态共振 + 动能三选一确认版（公共缓存 + 并发 + 高颜终端版）
+更新：优化T日K线对中轨包含/站上共振、趋势向上、近4日首次出现，并加入周线MACD动能增强过滤
 """
 import tushare as ts
 import pandas as pd
@@ -222,7 +223,7 @@ class DualChannelFilter:
                 try:
                     df = self._call_with_retry(
                         self.pro.daily, trade_date=d,
-                        fields='ts_code,trade_date,open,high,low,close,vol,amount,pct_chg' # 加入 amount
+                        fields='ts_code,trade_date,open,high,low,close,vol,amount,pct_chg'
                     )
                     if not df.empty: self.save_day_to_cache(d, df)
                     time.sleep(1.2 if (i + 1) % 20 == 0 else 0.2)
@@ -269,7 +270,6 @@ class DualChannelFilter:
                     df_daily = pd.concat([df_daily, pd.DataFrame([new_row])], ignore_index=True)
 
             O, C, H, L, V = df_daily['open'], df_daily['close'], df_daily['high'], df_daily['low'], df_daily['vol']
-            # 兼容没有amount的情况
             if 'amount' in df_daily.columns:
                 AMT = df_daily['amount'] * 1000
             else:
@@ -326,10 +326,17 @@ class DualChannelFilter:
 
             ANY_MOMENTUM = TURN_RED | KDJV_COND | MACDV_COND
 
-            # ================= 5. 形态A =================
+            # ================= 5. 形态A：中轨包含/站上共振 + 趋势向上 + 近4日首次出现 =================
             RED_UP = (C > O) & (C > C.shift(1))
             VOL_RATIO = V / V.rolling(5).mean().shift(1) > 1.2
             C1 = RED_UP & VOL_RATIO
+
+            IN_BBI = ((L <= BBI) & (H >= BBI)) | (C >= BBI)
+            IN_BBIBOLL_MID = ((L <= BBI) & (H >= BBI)) | (C >= BBI)
+            IN_KC_MID = ((L <= KC_MID) & (H >= KC_MID)) | (C >= KC_MID)
+
+            MID_RESONANCE = IN_BBI | IN_BBIBOLL_MID | IN_KC_MID
+            MID_UP_TREND = (BBI > BBI.shift(1)) & (KC_MID > KC_MID.shift(1))
 
             BREAK_BBI = (O <= BBI) & (C >= BBI)
             C2 = BREAK_BBI.rolling(8).sum() == 1
@@ -338,12 +345,11 @@ class DualChannelFilter:
             PREV_BELOW_BBI = L.shift(1) < BBI.shift(1)
             C3 = PREV_GREEN & PREV_BELOW_BBI
 
-            BBI_UP = BBI > BBI.shift(1)
-            INC_KC_MID = (O <= KC_MID) & (C >= KC_MID)
-            KC_UP = KC_MID > KC_MID.shift(1)
             A3_UP = AVWAP3 > AVWAP3.shift(1)
 
-            LOGIC_A = C1 & C2 & C3 & BBI_UP & INC_KC_MID & KC_UP & A3_UP
+            BASE_LOGIC_A = C1 & C2 & C3 & MID_RESONANCE & MID_UP_TREND & A3_UP
+            FIRST_APPEAR_4D = BASE_LOGIC_A & (BASE_LOGIC_A.rolling(4).sum() == 1)
+            LOGIC_A = FIRST_APPEAR_4D
 
             # ================= 6. 形态B =================
             B_PREV_DN = (C.shift(1) < O.shift(1)) & (C.shift(1) < C.shift(2))
@@ -363,7 +369,7 @@ class DualChannelFilter:
 
             LOGIC_B = B_PREV_DN & B_PREV_LOW & B_CURR_RED & B_INC_BOTH & B_UPR_UP & B_MID_UP & B_SLP_OK
 
-            # ================= 7. 全局防坑 =================
+            # ================= 7. 全局防坑与周线过滤 =================
             THREE_RED = (C > O).rolling(3).sum() == 3
             THREE_UP = (C > C.shift(1)).rolling(3).sum() == 3
             C5 = (THREE_RED | THREE_UP).rolling(5).sum().shift(1) == 0 
@@ -373,6 +379,7 @@ class DualChannelFilter:
             HIGH_OPEN = O > C.shift(1) * 1.03
             C8 = HIGH_OPEN.rolling(5).sum() == 0
 
+            # 基础周线趋势
             W_UP_DIFF = np.maximum(C - C.shift(1), 0)
             W_DN_DIFF = np.abs(C - C.shift(1))
             W_RSI = self.TDX_SMA(W_UP_DIFF, 70, 1) / self.TDX_SMA(W_DN_DIFF, 70, 1) * 100
@@ -389,8 +396,43 @@ class DualChannelFilter:
             W_KC_MID = C.ewm(span=100, adjust=False).mean()
             W_KC_UP = W_KC_MID >= W_KC_MID.shift(1)
 
+            # --- 新增：周线级别 MACD 动能过滤 ---
+            df_temp = df_daily.copy()
+            df_temp['trade_date'] = pd.to_datetime(df_temp['trade_date'], format='%Y%m%d')
+            df_temp.set_index('trade_date', inplace=True)
+            
+            # 聚合周线 (W: 周五收盘)
+            w_df = df_temp.resample('W').agg({
+                'open': 'first',
+                'high': 'max',
+                'low': 'min',
+                'close': 'last',
+                'vol': 'sum'
+            }).dropna()
+
+            if len(w_df) >= 15:
+                w_c = w_df['close']
+                w_dif = w_c.ewm(span=12, adjust=False).mean() - w_c.ewm(span=26, adjust=False).mean()
+                w_dea = w_dif.ewm(span=9, adjust=False).mean()
+                w_macd_bar = 2 * (w_dif - w_dea)
+                
+                # 当前周与前一周MACD柱对比
+                curr_w_bar = w_macd_bar.iloc[-1]
+                prev_w_bar = w_macd_bar.iloc[-2] if len(w_macd_bar) > 1 else 0
+                
+                # 条件1: 绿转红 (前周<=0 且 当周>0)
+                w_green_to_red = (prev_w_bar <= 0) and (curr_w_bar > 0)
+                # 条件2: 红柱高于前周红柱 (前周>0 且 当周>前周)
+                w_red_higher = (prev_w_bar > 0) and (curr_w_bar > prev_w_bar)
+                # 条件3: 绿柱比前周绿柱短 (前周<0 且 当周<0 且 当周绝对值 < 前周绝对值)
+                w_green_shorter = (prev_w_bar < 0) and (curr_w_bar < 0) and (abs(curr_w_bar) < abs(prev_w_bar))
+                
+                WEEK_MACD_OK = w_green_to_red or w_red_higher or w_green_shorter
+            else:
+                WEEK_MACD_OK = True # 数据不足时不作强制拦截
+
             # ================= 8. 最终判定 =================
-            FINAL_SIGNAL = (LOGIC_A | LOGIC_B) & C5 & C7 & C8 & WEEK_UP & W_KC_UP & ANY_MOMENTUM
+            FINAL_SIGNAL = (LOGIC_A | LOGIC_B) & C5 & C7 & C8 & WEEK_UP & W_KC_UP & WEEK_MACD_OK & ANY_MOMENTUM
 
             if FINAL_SIGNAL.iloc[-1] == True:
                 last_row = df_daily.iloc[-1]
@@ -400,7 +442,7 @@ class DualChannelFilter:
                     'name': name,
                     'close': round(last_row['close'], 2),
                     'pct_chg': round(pct_chg, 2),
-                    'signal_type': '形态A(回踩)' if LOGIC_A.iloc[-1] else '形态B(突破)',
+                    'signal_type': '形态A(回踩共振首现)' if LOGIC_A.iloc[-1] else '形态B(突破)',
                     'bbi_slp': round((BBI.iloc[-1] - BBI.iloc[-2]) / BBI.iloc[-2] * 100, 2),
                     'vol_ratio': round(V.iloc[-1] / V.rolling(5).mean().iloc[-2], 2)
                 }, 'selected'
