@@ -1,7 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-AVWAP+KC+BBI 多轨突破三日共振 (严格四选三修正版)
+AVWAP+KC+BBI 多轨突破三日共振 (双动量转红版)
 ==========================================================
+1. 基础过滤：严格保留沪深主板/创业板/科创板，排除ST/北交所
+2. 前日洗盘：收阴/下跌，且最低价跌破 BBIBOLL 中轨
+3. 低位防守：近5日无三连红/涨，近5日未碰过BBIBOLL上轨，近10日站上KC中轨天数<=5
+4. 当日量价：红盘上涨，量比>1.1，不高开3%以上，包含至少2条中轨
+5. 中轨方向：BBI与KC向上，且AVWAP绝不能红转绿
+6. 首现确认：近3个交易日首次出现该形态
+7. 动量转红：BIAS-V 或 %B-V 至少有一个量柱由绿转红
 """
 import tushare as ts
 import pandas as pd
@@ -42,7 +49,7 @@ def norm_date(d):
 
 class GlobalConfig:
     TUSHARE_TOKEN = 'a91652800def39d213abec3af9563e4485e83940bfbbd8276f8adaa8'
-    OUTPUT_DIR = os.path.join(os.path.expanduser('~'), 'Desktop', '多轨共振终极版_选股结果')
+    OUTPUT_DIR = os.path.join(os.path.expanduser('~'), 'Desktop', '多轨共振双动量_选股结果')
     CACHE_DIR = os.path.join(os.path.expanduser('~'), 'Desktop', 'A股日线公共缓存')
     LOOKBACK_DAYS = 500
     USE_PARQUET = True
@@ -392,7 +399,6 @@ class MultiTrackResonanceFilter:
 
             # ============ 1. 核心指标计算 ============
             BBI_MID = (C.rolling(3).mean() + C.rolling(6).mean() + C.rolling(12).mean() + C.rolling(24).mean()) / 4
-            BBIBOLL_MID = BBI_MID  # 注意：两者数学定义完全一致
             STD11 = BBI_MID.rolling(11).std(ddof=0)
             UPR_BBI = BBI_MID + 3 * STD11
             
@@ -417,31 +423,52 @@ class MultiTrackResonanceFilter:
             V_RATIO = V / V.rolling(5).mean().shift(1).replace(0, np.nan) > 1.1
             NO_GAP = (O <= C.shift(1) * 1.03).fillna(False)
 
-            # 严格四指标：BBI / BBIBOLL / KC / VWAP
             INC_BBI = ((O <= BBI_MID) & (C >= BBI_MID)).fillna(False)
-            INC_BBIBOLL = ((O <= BBIBOLL_MID) & (C >= BBIBOLL_MID)).fillna(False)
             INC_KC = ((O <= KC_MID) & (C >= KC_MID)).fillna(False)
             INC_VWAP = ((O <= VWAP_MID) & (C >= VWAP_MID)).fillna(False)
             
-            # 四选三
-            T_COUNT = (INC_BBI.astype(int) + INC_BBIBOLL.astype(int) + INC_KC.astype(int) + INC_VWAP.astype(int)) >= 3
+            T_COUNT = (INC_BBI.astype(int) + INC_KC.astype(int) + INC_VWAP.astype(int)) >= 2
 
             BBI_UP = (BBI_MID >= BBI_MID.shift(1)).fillna(False)
             KC_UP = (KC_MID >= KC_MID.shift(1)).fillna(False)
             DIR_UP = BBI_UP & KC_UP
 
             # ============ 5. AVWAP防红转绿 ============
-            AWAP_TURN_GREEN = ((VWAP_MID.shift(1) >= VWAP_MID.shift(2)) & (VWAP_MID < VWAP_MID.shift(1))).fillna(False)
-            AWAP_SAFE = ~AWAP_TURN_GREEN
+            AW_TURN_GRN = ((VWAP_MID.shift(1) >= VWAP_MID.shift(2)) & (VWAP_MID < VWAP_MID.shift(1))).fillna(False)
+            AWAP_SAFE = ~AW_TURN_GRN
 
-            # ============ 6. 综合判定与首现 ============
+            # ============ 6. 新增：双动量至少有一个转红 ============
+            # 指标1：BIAS-V 动量柱
+            BIAS5 = (C - C.rolling(5).mean()) / C.rolling(5).mean() * 100
+            DIF_B = BIAS5.ewm(span=5, adjust=False).mean() - BIAS5.ewm(span=21, adjust=False).mean()
+            DEA_B = DIF_B.ewm(span=10, adjust=False).mean()
+            B_BAR = (DIF_B - DEA_B) * 2
+            TURN_RED_BIAS = ((B_BAR.shift(1) < 0) & (B_BAR > 0)).fillna(False)
+
+            # 指标2：%B-V 动量柱
+            BOLL_MID = C.rolling(23).mean()
+            BOLL_STD = C.rolling(23).std(ddof=0)
+            BOLL_UPR = BOLL_MID + 2 * BOLL_STD
+            BOLL_DWN = BOLL_MID - 2 * BOLL_STD
+            PCT_B = (C - BOLL_DWN) / (BOLL_UPR - BOLL_DWN + 0.0001) * 100
+            
+            B_EMA3 = PCT_B.ewm(span=3, adjust=False).mean()
+            B_EMA10 = PCT_B.ewm(span=10, adjust=False).mean()
+            B_BAR2 = (B_EMA3 - B_EMA10) * 2
+            TURN_RED_PCTB = ((B_BAR2.shift(1) < 0) & (B_BAR2 > 0)).fillna(False)
+
+            MOM_RED = TURN_RED_BIAS | TURN_RED_PCTB
+
+            # ============ 7. 综合判定与首现 ============
             FORM = PREV_DN & ANTI_3_COND & NO_BREAK_UPR & KC_ABOVE_CNT & T_RED & V_RATIO & NO_GAP & T_COUNT & DIR_UP & AWAP_SAFE
             FORM = FORM.fillna(False)
             
             FIRST_FORM = FORM & (FORM.rolling(3).sum() == 1)
             FIRST_FORM = FIRST_FORM.fillna(False)
 
-            if bool(FIRST_FORM.iloc[target_idx]):
+            FINAL_SIGNAL = FIRST_FORM & MOM_RED
+
+            if bool(FINAL_SIGNAL.iloc[target_idx]):
                 last_row = df_daily.iloc[target_idx]
                 pct_chg = 0.0
                 if 'pct_chg' in df_daily.columns and not pd.isna(last_row['pct_chg']):
@@ -452,6 +479,11 @@ class MultiTrackResonanceFilter:
                 kc_val = round(float(KC_MID.iloc[target_idx]), 2)
                 vwap_val = round(float(VWAP_MID.iloc[target_idx]), 2)
 
+                # 提取动量指标数值用于展示
+                bias_bar_val = round(float(B_BAR.iloc[target_idx]), 3)
+                pctb_bar_val = round(float(B_BAR2.iloc[target_idx]), 3)
+                trigger_by = "BIAS" if bool(TURN_RED_BIAS.iloc[target_idx]) else "%B"
+
                 res_dict = {
                     'ts_code': ts_code,
                     'name': name,
@@ -460,7 +492,10 @@ class MultiTrackResonanceFilter:
                     'vol_ratio': vol_ratio_val,
                     'bbi': bbi_val,
                     'kc': kc_val,
-                    'vwap': vwap_val
+                    'vwap': vwap_val,
+                    'bias_bar': bias_bar_val,
+                    'pctb_bar': pctb_bar_val,
+                    'trigger_by': trigger_by
                 }
                 return [res_dict], 'selected'
 
@@ -516,19 +551,20 @@ class MultiTrackResonanceFilter:
         if not results:
             return
         mode = "_实时" if is_intraday else ""
-        path = os.path.join(GlobalConfig.OUTPUT_DIR, f"多轨共振_{trade_date}{mode}.txt")
+        path = os.path.join(GlobalConfig.OUTPUT_DIR, f"多轨共振双动量_{trade_date}{mode}.txt")
         with open(path, 'w', encoding='utf-8') as f:
-            f.write(f"多轨突破三日共振(前复权) - {trade_date}\n")
+            f.write(f"多轨突破三日共振 + 双动量转红(前复权) - {trade_date}\n")
             f.write(f"共选中 {len(results)} 只\n\n")
             for i, s in enumerate(results, 1):
                 f.write(f"{i:3d}. {s['ts_code']} {s['name']} 价:{s['close']:.2f} 涨:{s['pct_chg']:+.2f}% "
-                        f"量比:{s['vol_ratio']:.2f} BBI:{s['bbi']:.2f} KC:{s['kc']:.2f} VWAP:{s['vwap']:.2f}\n")
+                        f"量比:{s['vol_ratio']:.2f} BBI:{s['bbi']:.2f} KC:{s['kc']:.2f} VWAP:{s['vwap']:.2f} "
+                        f"由[{s['trigger_by']}]转红\n")
         print(f"结果已保存: {path}")
 
 
 def main():
     print("=" * 110)
-    print(f"{BOLD} 多轨突破三日共振 (严格四选三) {RESET}")
+    print(f"{BOLD} 多轨突破三日共振 (双动量转红版) {RESET}")
     print("=" * 110)
     filter_tool = MultiTrackResonanceFilter(GlobalConfig.TUSHARE_TOKEN)
 
@@ -554,12 +590,12 @@ def main():
 
         if results:
             print("\n" + "=" * 120)
-            print(f"{BOLD}{CYAN}【结果】多轨突破共振 - {validated_date} - 共 {len(results)} 只{RESET}")
+            print(f"{BOLD}{CYAN}【结果】多轨共振双动量 - {validated_date} - 共 {len(results)} 只{RESET}")
             for i, s in enumerate(results, 1):
                 color = RED if i % 2 == 1 else YELLOW
                 print(f"\n{color}{BOLD}  {i:2d}. {s['ts_code']} {s['name']:<8} "
                       f"价:{s['close']:8.2f} 涨:{s['pct_chg']:+6.2f}% 量比:{s['vol_ratio']:.2f}{RESET}")
-                print(f"      BBI:{s['bbi']:.2f}  KC:{s['kc']:.2f}  VWAP:{s['vwap']:.2f}")
+                print(f"      BBI:{s['bbi']:.2f} KC:{s['kc']:.2f} VWAP:{s['vwap']:.2f} | BIAS柱:{s['bias_bar']:.3f} %B柱:{s['pctb_bar']:.3f} (由{s['trigger_by']}触发)")
         else:
             print(f"\n{YELLOW}本次未选出股票，请检查条件或换日期重试。{RESET}")
 
